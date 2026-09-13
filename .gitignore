@@ -39,3 +39,8 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# Web 管理台:前端依赖与构建产物(dist 由构建期生成,仅提交 .gitkeep 占位)
+node_modules/
+internal/web/dist/*
+!internal/web/dist/.gitkeep
