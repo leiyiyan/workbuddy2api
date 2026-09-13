@@ -219,7 +219,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -266,7 +266,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	}
 
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -285,7 +285,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`))
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "")
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
@@ -324,7 +324,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	c.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -395,6 +395,45 @@ func TestDailyCheckinAlready(t *testing.T) {
 	}
 }
 
+// TestIsAlreadyCheckin "今天已签到"判定为幂等成功（中文/英文 markers 均命中）。
+func TestIsAlreadyCheckin(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10001,"msg":"今天已签到"}`), nil
+	})
+	if !IsAlreadyCheckin(c.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("今天已签到 应判为 already")
+	}
+
+	c2 := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10001,"msg":"Already checked in today"}`), nil
+	})
+	if !IsAlreadyCheckin(c2.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("already(英文) 应判为 already")
+	}
+}
+
+// TestIsAlreadyCheckinRejectsNonUpstream 网络层/解析层错误不得当作幂等成功。
+// 误判会让当天实际未签到的账号被标成正常（停机补签遇到抖动时尤其危险）。
+func TestIsAlreadyCheckinRejectsNonUpstream(t *testing.T) {
+	if IsAlreadyCheckin(errors.New("dial tcp: connection refused")) {
+		t.Error("网络错误不得判为 already")
+	}
+	if IsAlreadyCheckin(errors.New("parse failed: unexpected EOF")) {
+		t.Error("解析错误不得判为 already")
+	}
+	// 非"已签到"语义的上游业务错误（如余额不足）也不得判为 already。
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10002,"msg":"积分不足，请充值"}`), nil
+	})
+	if IsAlreadyCheckin(c.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("余额不足不得判为 already")
+	}
+	// nil 不判为 already。
+	if IsAlreadyCheckin(nil) {
+		t.Error("nil 不得判为 already")
+	}
+}
+
 func TestBasesAlwaysCN(t *testing.T) {
 	c := testClient(nil)
 	cn := &auth.Auth{Domain: ""}
@@ -445,7 +484,7 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}

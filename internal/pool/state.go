@@ -103,6 +103,45 @@ func (p *Pool) NoteError(uid string) {
 	}
 }
 
+// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本。
+// credit 为上游 usage.credit（本次真实扣费），tokens 为本次请求的 token 总数
+// （prompt+completion，用于折算单位成本）。tokens<=0 时不记录：无法折算单价，
+// 记进去会污染账本。
+//
+// 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
+// 账本仅内存态——成本随上游活动（限免期/夜间免费/折扣）变化，持久化旧值
+// 反而是脏数据；重启后重新学习，代价只是前几次请求无偏好。
+func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
+	if uid == "" || model == "" || tokens <= 0 {
+		return
+	}
+	// 单价按每千 token 归一，消除请求长度差异。
+	per1k := credit / float64(tokens) * 1000
+	if per1k < 0 {
+		per1k = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if e.modelCost == nil {
+		e.modelCost = make(map[string]modelCostEntry)
+	}
+	const alpha = 0.3
+	prev, seen := e.modelCost[model]
+	if !seen {
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+	} else {
+		e.modelCost[model] = modelCostEntry{
+			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
+			LastSeen:  time.Now(),
+			Samples:   prev.Samples + 1,
+		}
+	}
+}
+
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
@@ -163,6 +202,50 @@ func (p *Pool) AvailableUIDs() []string {
 	return uids
 }
 
+// AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
+// 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入
+// （issue #31 模型豁免）。
+// 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
+func (p *Pool) AvailableUIDsForModel(model string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	uids := make([]string, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
+}
+
+// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
+// 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
+// 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
+// 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
+func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	if p.inFlightFull(e) {
+		return nil
+	}
+	e.lastUsed = now
+	return e.a
+}
+
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
@@ -209,16 +292,24 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 	return total, healthy, cooling, disabled, inFlightFull
 }
 
-// ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
+// ServableNow 报告池当前是否可服务：存在至少一个（对任意模型）healthy 且未占满在途名额的账号。
 // 与 CountsDetailed 的 healthy 口径不同：healthy 只看 disabled/until/breakerUntil（状态机权威判定），
 // 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
+//
+// 模型级豁免（issue #31 的探活侧补齐）：6004 模型级软冷却中的账号（modelExempt 形态）
+// 对触发模型不可用、对其他模型仍可选——chat 的 healthyForModel 已按此放行切模型请求，
+// 探活必须同口径，否则"全号被 v4.1 限流但 glm 可用"时 chat 实际 200 而 /healthz 误报 503。
+// /healthz 无请求模型上下文，取"存在可服务模型"的存在性语义（与 chat 可达性等价）。
 func (p *Pool) ServableNow() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
-		if e.healthy(now) && !p.inFlightFull(e) {
+		if p.inFlightFull(e) {
+			continue
+		}
+		if e.healthy(now) || e.modelExempt() {
 			return true
 		}
 	}

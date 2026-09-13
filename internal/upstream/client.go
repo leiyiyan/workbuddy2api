@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -114,6 +115,11 @@ var contentBlockedMarkers = []string{
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 var badParamsMarkerCode = `"code":11101`
+
+// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
+// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
+var alreadyCheckinMarkers = []string{"已签到", "already"}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -257,13 +263,44 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	// UserAgent 出站 User-Agent 覆盖（空 = 现状 clientUA）。
-	// 全部出站请求生效：chat / refresh / checkin / balance(含 report/travel) / FetchModels。
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
+	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
+	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
+	// （仅当 client_name 非空，见 billingUA）。
 	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`（product.json applicationName=WorkBuddy，
-	// UserAgentHttpInterceptor 把 productName/platform 前缀拼进 UA）。默认保持现状
-	// （指纹净化考虑），仅当用户显式配置才改写。
+	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUA。默认值已对齐官方（A 段变更），
+	// 用户仍可显式配置完全自定义的 UA。
 	UserAgent string
+
+	// DeviceToken 设备风控 Token（X-Device-Token 头）兜底来源：config upstream.device_token。
+	// 仅当 auth.Auth.DeviceToken 为空时才取此值；两者皆空则不注入该头。
+	// 容器内无桌面端 Turing SDK，这是把外部（宿主/桌面端）生成的 token 注入的入口。
+	// 另见 DeviceTokenFile 缓存读取：宿主可把 token 落 /app/data/device_token 共用。
+	DeviceToken string
+
+	// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
+	// 读取频率限 5 分钟一次缓存（见 device_token.go），>1KB 或读失败则忽略。
+	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
+	DeviceTokenFile string
+
+	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
+	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。
+	// 非空（如 "WorkBuddy"）则四头跟随，对齐官方桌面端 client 识别。
+	ClientName string
+
+	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
+	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.5.4 分发包）。
+	// config upstream.client_version 覆盖。
+	ClientVersion string
+
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认 defaultCliVersion
+	// （对齐官方内置 CLI 2.137.1）。config upstream.cli_version 覆盖。
+	CliVersion string
+
+	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
+	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 参数传入 ChatStream，
+	// 由 ChatHeaders 注入（不再挂共享字段，杜绝并发串扰）。
+	PassthroughIP bool
 
 	ChatBaseCN    string
 	BillingBaseCN string
@@ -397,15 +434,17 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
+// clientIP 为本次请求的客户端 IP（PassthroughIP=true 时注入；空串表示不透传）。
+// 按**请求传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	c.ChatHeaders(req, a)
+	c.ChatHeaders(req, a, clientIP)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
 	resp, err := c.chatHTTP().Do(req)
@@ -596,6 +635,22 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 func (c *Client) DailyCheckin(a *auth.Auth) error {
 	_, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
 	return err
+}
+
+// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
+// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
+// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+func IsAlreadyCheckin(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	for _, m := range alreadyCheckinMarkers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

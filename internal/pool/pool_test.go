@@ -942,6 +942,61 @@ func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ServableNow 的模型级豁免（issue #31 探活侧）：6004 单模型限流时，账号对该模型
+// 不可用但对其他模型仍可选，/healthz 不得因"全号被某一模型限流"而误报 503。
+// ---------------------------------------------------------------------------
+
+func TestServableNowModelExemptCounts(t *testing.T) {
+	// 单号处于 6004 模型级软冷却（带解析时间、记录 softRateModel）→ 其他模型仍可达，
+	// ServableNow 必须为 true（与 chat 的 healthyForModel 放行切模型请求同口径）。
+	// 反向（同模型不可选）已由 TestPickExcludingForModelSkipsSoftCoolingSameModel 覆盖；
+	// 本池无其他候选，同模型选号会走全冷却兜底，不在此重复断言。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	if !p.ServableNow() {
+		t.Fatal("model-exempt account must keep pool servable (other models reachable)")
+	}
+}
+
+func TestServableNowPlainSoftNotExempt(t *testing.T) {
+	// 普通软冷却（无 softRateModel，非 6004 模型级）→ 账号级不可用，ServableNow 必须 false。
+	// 守门：豁免不得从模型级泄漏到普通冷却。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	if p.ServableNow() {
+		t.Fatal("plain soft cooling (no model) must NOT be servable")
+	}
+}
+
+func TestServableNowExemptButInFlightFull(t *testing.T) {
+	// 模型豁免形态 + 在途占满 → 仍不可服务（在途维度独立于豁免，探活须叠加判定）。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(1)
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	if !p.Acquire("u1") {
+		t.Fatal("acquire should succeed at max=1")
+	}
+	defer p.Release("u1")
+	if p.ServableNow() {
+		t.Fatal("model-exempt but in-flight-full account must not count as servable")
+	}
+}
+
+func TestServableNowExemptButDisabled(t *testing.T) {
+	// 模型豁免形态 + 被禁用（session dead）→ disabled 优先级最高，ServableNow 必须 false。
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "429 rate limit")
+	p.Disable("u1", "session dead")
+	if p.ServableNow() {
+		t.Fatal("disabled account must never be servable, even in model-exempt form")
+	}
+}
+
 // TestSoftRateModelClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
 // **非模型级**软冷却（plain Cooldown），softRateModel 必须被清空——否则上次 6004 的
 // 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。
@@ -1122,6 +1177,73 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 	}
 	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
 		t.Fatalf("state.json not written on success: %v %s", err, raw)
+	}
+}
+
+// TestSaveLockedPermissionDenied 不可写目录触发落盘失败：首错详报出现且无 panic，
+// persistFails 计数累加。chmod 0500 模拟容器内 app(uid 10001) 对 root:root 目录
+// 无写权限的 issue #52 场景。注意：若测试以 root 运行，chmod 不阻写——此时回落到
+// "父路径是文件"的可靠失败路径，保证测试恒定可复现。
+func TestSaveLockedPermissionDenied(t *testing.T) {
+	dir := t.TempDir()
+	stateFp := filepath.Join(dir, "state.json")
+	p := New(stateFp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 7)
+
+	// chmod 0500 让普通用户不可写；root 仍可写（见下方回落）。
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	p.Flush()
+	fails1 := p.persistFails
+
+	if fails1 == 0 {
+		// root 下 chmod 不阻写 → 回落到"父路径是文件"的可靠失败路径重测。
+		block := filepath.Join(t.TempDir(), "block")
+		if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p2 := New(filepath.Join(block, "state.json"))
+		p2.Add(&auth.Auth{UID: "u1"})
+		p2.SetCredits("u1", 7)
+		p2.Flush()
+		if p2.persistFails == 0 {
+			t.Fatal("persist failure should be recorded (chmod or block-path), got 0")
+		}
+		fails1 = p2.persistFails
+	}
+	if fails1 == 0 {
+		t.Fatal("persist failure should be recorded")
+	}
+	// 无 panic 即通过（首错详报已由 notePersistFail 打印，恢复日志由零值门槛触发）。
+}
+
+// TestSaveLockedRecover 先失败后恢复：首错详报 + 恢复日志 + persistFails 归零。
+func TestSaveLockedRecover(t *testing.T) {
+	// 阶段 1：父路径是文件 → 落盘失败，persistFails 累加。
+	block := filepath.Join(t.TempDir(), "block")
+	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(filepath.Join(block, "state.json"))
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCredits("u1", 42)
+	p.Flush()
+	if p.persistFails == 0 {
+		t.Fatal("first flush should fail (block path)")
+	}
+
+	// 阶段 2：切到可写目录 → 落盘成功，persistFails 归零（恢复日志由零值门槛触发）。
+	good := filepath.Join(t.TempDir(), "state.json")
+	p.stateFp = good
+	p.dirty.Store(true) // 强制再写一次
+	p.Flush()
+	if p.persistFails != 0 {
+		t.Fatalf("successful save should reset persistFails, got %d", p.persistFails)
+	}
+	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
+		t.Fatalf("state.json not written on recovery: %v %s", err, raw)
 	}
 }
 

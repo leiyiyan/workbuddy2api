@@ -36,7 +36,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
 | 🔄 **多账号池** | 三因子加权随机选号（积分占比 ×10 + 闲置补偿 + 成功率 ×3），Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
-| 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
+| 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失；**按模型判定可用性**——该模型被 6004 限额时立即重分配 |
+| 💰 **成本优先选号** | 按每次响应的实测扣费（`usage.credit`）记账 `(账号, 模型)`，选号时免费 / 便宜的号优先——同一模型自动优先走仍在限免期的号 |
 | ⏰ **定时任务** | 签到（09/21 点）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
@@ -244,16 +245,24 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 选号策略
 
-1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与
-2. 取 **Top-5** 候选（按三因子权重降序，积分只是因子之一）
-3. 三因子加权随机：
+1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与（请求带 `model` 时改用 `healthyForModel` 口径：被该模型 6004 限额的账号不参与，被**其他**模型限额的账号照常参与）
+2. **成本分层**（请求带 `model` 时）：按该模型的实测扣费把候选分层，只保留最优层——
+   - `0` = 已实测**免费**（限免期 / 夜间免费的号）
+   - `1` = **无观测**（含观测过期；新号的限免状态只能靠实测发现，故给它机会）
+   - `2` = 已实测**收费**
+
+   同层内按单价升序。观测按每千 token 归一、EMA 平滑，**6 小时**未更新即失效（避免「夜间免费」在白天仍被当作免费）。
+3. 取 **Top-5** 候选（按三因子权重降序，积分只是因子之一）
+4. 三因子加权随机：
 
    `weight = credits 比例 ×10 + idleWeight + successRate ×3`
 
    - `credits 比例` = 该号积分 / 候选集最大积分
    - `idleWeight` = `min(闲置小时 × idle_weight_per_hour, idle_weight_max)`，从未使用给满分
    - `successRate` = `successCount/(successCount+errTotal)`，无记录给中性 1.5
-4. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
+5. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
+
+> **成本账本从哪来**：上游没有「按模型的用量」接口（`get-user-resource` 只给套餐级积分汇总），所以「哪个号在这个模型上免费 / 便宜」只能**实测**——每次成功请求读响应 `usage.credit`，按 token 数折算成每千 token 单价，记入 `(账号, 模型)` 账本。账本仅内存态（成本随上游活动变化，持久化旧值反而是脏数据），重启后重新学习。模型接口虽然也返回 `credits` 倍率，但**所有账号看到的值相同**，无法区分「新号限免 / 老号收费」，故不采用。
 
 ### 会话粘性
 
@@ -262,6 +271,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 会话键提取顺序：`metadata.conversation_id` → `metadata.conversationId` → `metadata.user_id` → 顶层 `conversation_id` → 顶层 `conversationId`（snake_case 优先于 camelCase）
 - TTL 滚动续期（默认 30m），GC 周期 5m；绑定可镜像到 Redis（7 天 TTL）防重启丢失
 - 请求失败自动解绑；成功后绑定跟随最终成功账号
+- **按模型判定可用性**：绑定只记 uid，而同一个会话可能换模型。账号被 6004 模型级限额后对其他模型仍可用，因此粘性按「该模型上是否可用」校验——在当前模型被限额时立即重分配，而不是被钉在这个号上直到轮换次数耗尽
 
 ### 定时任务
 
@@ -289,7 +299,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 - `conversationId` 由网关生成（`wb2api-<ms>`），无需真实会话
 - 限速：账号间间隔 800ms（与旅行同口径）
 - **streak 自检**：上报成功后回读连登天数（只读 oracle），日志每号一行可 grep：`activity <uid>: streak days=N`。`days=0` 记 **warn**（`report OK but streak.days=0 (silent drop?)`，对应上游「200 但静默丢弃」）；回读失败记 warn 但不影响主流程（上报按天幂等，不重试，只观测）
-- 手动诊断 / 补跑用 `python3 scripts/probe_active.py`（只读探测；写操作默认 dry-run，需 `--yes`）
+- 手动诊断 / 补跑用 `python3 scripts/task_runner.py`（成长任务一体机：查询/完成/领奖；默认 dry-run，写操作需 `--yes`）
 
 #### 猫猫旅行（独立排程）
 
@@ -391,7 +401,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
 
-- **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
+- **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
 - 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
@@ -405,7 +415,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
-| `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
+| `python3 scripts/task_runner.py ALL` | 成长任务查询（默认 dry-run 只展示）；`--yes` 全量完成并领奖，`--only <task_code>` 指定单个任务，`--only-claim` 只领奖不点亮 |
 
 二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
 

@@ -73,6 +73,9 @@ func main() {
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
 			Available:  p.AvailableUIDs,
+			// 按模型的可用性口径：绑定号在当前模型被 6004 限额时重分配，
+			// 而不是被钉在这个号上反复失败。
+			AvailableForModel: p.AvailableUIDsForModel,
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -96,8 +99,18 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
-	// 出站 UA 覆盖（issue #42）：非空才改写，空 = 现状 clientUA（指纹净化考虑）。
+	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
+	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
 	up.UserAgent = cfg.Upstream.UserAgent
+	// 版本段（upstream.client_version / cli_version）：空 = 各走内置默认。
+	up.ClientVersion = cfg.Upstream.ClientVersion
+	up.CliVersion = cfg.Upstream.CliVersion
+	// 设备风控头（X-Device-Token）全局兜底 + 文件读取路径；空 = 不注入。
+	up.DeviceToken = cfg.Upstream.DeviceToken
+	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
+	up.ClientName = cfg.Upstream.ClientName
+	up.PassthroughIP = cfg.Upstream.PassthroughIP
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
