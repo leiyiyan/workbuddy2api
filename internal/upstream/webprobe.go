@@ -460,7 +460,13 @@ func (c *Client) userResourceLegacy(a *auth.Auth) (*ResourceRich, error) {
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	}
-	data, err := c.billingJSON(a, http.MethodPost, billingMeterPath, body)
+	// 上游把 billingMeterPath 重定义为 global 首选(无 /v2),CN 现状移到
+	// billingMeterPathV2。这里按"先 CN 现状、后 global 形态"双路尝试,
+	// 避免常量语义变化后 CN 账号落到 /billing/... 直接 404。
+	data, err := c.billingJSON(a, http.MethodPost, billingMeterPathV2, body)
+	if err != nil {
+		data, err = c.billingJSON(a, http.MethodPost, billingMeterPath, body)
+	}
 	if err != nil {
 		return nil, err
 	}
