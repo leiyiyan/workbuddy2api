@@ -225,7 +225,7 @@ func main() {
 		root.Handle("GET /healthz", h)
 		root.Handle("/", webH)
 		httpHandler = root
-		log.Printf("web 管理台已启用：http://127.0.0.1%s/（/api/* 与网关同一把 api_key）", cfg.Listen)
+		log.Printf("web 管理台已启用：http://%s/（/api/* 与网关同一把 api_key）", loopHost)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
