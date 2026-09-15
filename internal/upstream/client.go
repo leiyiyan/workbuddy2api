@@ -33,6 +33,7 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -54,11 +55,68 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrAccountFault:
 		return "account_fault"
+	case ErrModelBlocked:
+		return "model_blocked"
 	case ErrClient:
 		return "client"
 	default:
 		return "none"
 	}
+}
+
+// matchMode 描述错误分类 marker 的匹配通道。6 组词表 + 文案分类共用同一匹配器，
+// 消除「小写 Contains + 原文 Contains 双通道」在 Classification 各分支的手写循环重复。
+type matchMode uint8
+
+const (
+	// matchFold 大小写不敏感：lower(body) 含 lower(pat) 或 body 原字串含 pat。
+	// 双通道与历史手写循环逐字等价（小写比较 + 中文原文比较）。
+	matchFold matchMode = iota
+	// matchExact 大小写敏感的字面包含。
+	matchExact
+	// matchLower 在 lower(body) 上做包含匹配（pat 须已小写）。
+	matchLower
+)
+
+// errorRule 一条错误分类规则：命中 patterns 中任一 marker 即归类为 kind。
+type errorRule struct {
+	kind     ErrKind
+	mode     matchMode
+	patterns []string
+}
+
+// matchPattern 报告 body 是否命中单个 marker pattern。
+func matchPattern(p string, mode matchMode, body, lower string) bool {
+	switch mode {
+	case matchFold:
+		return strings.Contains(lower, strings.ToLower(p)) || strings.Contains(body, p)
+	case matchExact:
+		return strings.Contains(body, p)
+	case matchLower:
+		return strings.Contains(lower, p)
+	default:
+		return false
+	}
+}
+
+// hit 报告 rule 是否命中 body（任一 marker 命中即真）。
+func (r errorRule) hit(body, lower string) bool {
+	for _, p := range r.patterns {
+		if matchPattern(p, r.mode, body, lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstHit 返回第一条命中的 marker 原文（供「哪个词命中」的场景）；无命中返回 ""。
+func (r errorRule) firstHit(body, lower string) string {
+	for _, p := range r.patterns {
+		if matchPattern(p, r.mode, body, lower) {
+			return p
+		}
+	}
+	return ""
 }
 
 // Error 带分类的上游错误。
@@ -72,15 +130,15 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
 }
 
-// hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
-var hardMarkers = []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
+// hardRule 余额不足关键词（大小写不敏感 + 中文原文双通道）。
+var hardRule = errorRule{kind: ErrHardCredit, mode: matchFold, patterns: []string{
+	"insufficient credit", "no credit", "credit exhausted", "credits exhausted", "out of credit",
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
-}
+}}
 
-// softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
+// softRateRule 限流/节流关键词（小写比较 + 中文原文比较双通道）。
 // 上游在状态码非 429 时也会返回限流语义（如 200 + code 11140
 // "The model provider is rate-limiting requests."、400 + "rate limit"），
 // 此类响应若不识别，账号既不被冷却也不喂熔断，下次请求仍会被选中（issue #28）。
@@ -89,7 +147,7 @@ var hardMarkers = []string{
 // 连字符形式（rate-limiting / rate-limited）需单列——Contains 不跨 '-'。
 // "too many" 会命中 "too many tokens" 这类客户端参数错误，代价是该号被软冷却
 // 一个 SoftCooldown（默认 60s）后自愈，远小于漏判限流导致反复选中同一号的代价。
-var softRateMarkers = []string{
+var softRateRule = errorRule{kind: ErrSoftRate, mode: matchFold, patterns: []string{
 	"rate limit", // rate limit / rate limits / rate limiting
 	"rate-limiting",
 	"rate-limited",
@@ -97,21 +155,21 @@ var softRateMarkers = []string{
 	"too many",
 	"usage limit", // usage limit reached / model usage limit exceeded（用量节流，非计费余额）
 	"请求过于频繁", "限流",
-}
+}}
 
-var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns: []string{"Offline user session not found", "12153"}}
 
-// contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
+// contentBlockedRule 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
 // 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
 // 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
 // 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
 // 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
-var contentBlockedMarkers = []string{
+var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, patterns: []string{
 	"blocked by security policy",
 	"unapproved channel",
 	"illegal api invocation",
-}
+}}
 
 // contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
 // [关键词] 填分类词（色情 / nsfw / 暴力 等），绝不填业务 code、账号、冷却、upstream 前缀。
@@ -146,25 +204,27 @@ func contentBlockedKeyword(body string) string {
 	}
 	lower := strings.ToLower(text)
 	for _, kw := range contentBlockedKeywords {
-		if strings.Contains(lower, strings.ToLower(kw)) {
+		if strings.Contains(lower, kw) {
 			return kw
 		}
 	}
 	return contentBlockedFallbackKeyword
 }
 
-// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
+// badParamsRule 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
-var badParamsMarkerMsg = "Unmarshal chat params failed"
-var badParamsMarkerCode = `"code":11101`
+var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []string{
+	"Unmarshal chat params failed",
+	`"code":11101`,
+}}
 
-// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var alreadyCheckinMarkers = []string{"已签到", "already"}
+var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签到", "already"}}
 
-// accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
+// accountFaultRule 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
 // 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
@@ -175,14 +235,14 @@ var alreadyCheckinMarkers = []string{"已签到", "already"}
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
 // 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateMarkers
+// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateRule
 // 先命中）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案），
 // 120 与 private 均落同一分类。14017 文案唯一（无软限流歧义），可安全收录。
-var accountFaultMarkers = []string{
+var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, patterns: []string{
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
-}
+}}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -196,8 +256,17 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
+const softRateResetPattern = `将在 (.+?) 重置`
+
+// 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
+// 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
+// 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
+// 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
+var (
+	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+)
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
@@ -206,20 +275,73 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	return re.MatchString(body)
+	return reModelRateLimit.MatchString(body)
 }
 
-// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
-// 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
-// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
-// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
-func ParseSoftRateReset(body string) (time.Time, bool) {
-	if !IsModelRateLimit(body) {
-		return time.Time{}, false
+// modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。
+const modelBlockCode = "11102"
+
+// modelBlockMsgMarker 11102 答复的确定性文案（官方 error message 固定短语）。
+// 只收这个窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的 not found 措辞
+// （reference maiphucgiang 报告提的「11102 撞在 ID 上」坑的同类问题：宁缺毋滥）。
+const modelBlockMsgMarker = "service info not found"
+
+// ModelBlockReason 11102 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
+// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11102" 前缀识别条目
+// （与 6004 条目的 "6004 model rate limit" reason 互不干扰，两者共存于同一 map 键）。
+const ModelBlockReason = "11102 model not available"
+
+// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 的确定性答复。
+//
+// 只比对 code/msg 等独立字段，绝不做整段文本子串匹配：错误体还带 requestId 等字段，
+// 拿整段文本匹配会把 "11102" 撞在 ID 上、误避让一个本来能用的模型（reference
+// converter._parse_not_servable 的坑，app/model_blocks.py:408-411 讨论）。
+// 判定 = code 字段精确等于 "11102"，或 msg/message 字段命中窄短语 "service info not found"
+// （两者任一命中即真）。只看 400/404：429 带 11102 属限流语义（不在此判定范围）。
+// 字段遍历覆盖顶层与 error 子对象两层（对齐 converter 的 nodes 收集口径）。
+func IsModelBlocked(status int, body string) bool {
+	if (status != http.StatusBadRequest && status != http.StatusNotFound) || body == "" {
+		return false
 	}
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
+	// 轻量预检：body 既无 "11102" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
+	if !strings.Contains(body, modelBlockCode) && !strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
+		return false
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	nodes := []map[string]any{root}
+	if inner, ok := root["error"].(map[string]any); ok {
+		nodes = append(nodes, inner)
+	}
+	code, msg := "", ""
+	for _, node := range nodes {
+		for _, key := range []string{"code", "errCode", "error_code"} {
+			if v, ok := node[key]; ok && v != nil && code == "" {
+				code = strings.TrimSpace(fmt.Sprint(v))
+			}
+		}
+		for _, key := range []string{"msg", "message"} {
+			if v, ok := node[key].(string); ok && v != "" && msg == "" {
+				msg = strings.TrimSpace(v)
+			}
+		}
+	}
+	if code == modelBlockCode {
+		return true
+	}
+	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+}
+
+// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
+//
+// 是否走模型级豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
+// IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
+// 的限流也照常由调用方退回有界退避（绝不臆造时间）。
+func ParseRateReset(body string) (time.Time, bool) {
+	m := reSoftRateReset.FindStringSubmatch(body)
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
@@ -235,48 +357,50 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
-//  1. 402 / hardMarkers —— 计费额度耗尽，最严、最不可自愈，必须最先判。
+//  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
+//     （详见 IsModelBlocked 注释）。
+//  1. 402 / hardRule —— 计费额度耗尽，最严、最不可自愈，必须最先判。
 //     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
 //     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
-//  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
+//  2. sessionDeadRule —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
-//  3. accountFaultMarkers —— 账号级授权/配额故障（11140 request illegal auth 风控、
+//  3. accountFaultRule —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
 //     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
 //     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
-//     落到 softRateMarkers 层，不受影响。
-//  4. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     落到 softRateRule 层，不受影响。
+//  4. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
 //     结果同为 soft_rate，与下一层一致。
 //  5. status==429 —— body 无文案时的兜底识别。
 //  6. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
 func Classify(status int, body string) ErrKind {
+	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
+	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
+	// 但可能被更宽的 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
+	// 先于 hardRule：11102 答复的 msg 是模型不存在，不含 credit/quota/积分 等计费词，
+	// 正常不会撞 hardRule，但前置判定让语义零歧义（防上游未来在 msg 里混入余额词）。
+	if IsModelBlocked(status, body) {
+		return ErrModelBlocked
+	}
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
+	if hardRule.hit(body, lower) {
+		return ErrHardCredit
 	}
-	for _, m := range sessionDeadMarkers {
-		if strings.Contains(body, m) {
-			return ErrSessionDead
-		}
+	if sessionDeadRule.hit(body, lower) {
+		return ErrSessionDead
 	}
-	for _, m := range accountFaultMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrAccountFault
-		}
+	if accountFaultRule.hit(body, lower) {
+		return ErrAccountFault
 	}
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrSoftRate
-		}
+	if softRateRule.hit(body, lower) {
+		return ErrSoftRate
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
@@ -289,23 +413,21 @@ func Classify(status int, body string) ErrKind {
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
+	// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+	// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
+	// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+	// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
+	// 模型权限，值得再试一次）。
 	if status >= 400 {
-		for _, m := range contentBlockedMarkers {
-			if strings.Contains(lower, m) {
-				return ErrContentBlocked
-			}
+		if contentBlockedRule.hit(body, lower) {
+			return ErrContentBlocked
 		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if badParamsRule.hit(body, lower) {
 			return ErrBadParams
 		}
 		return ErrClient
 	}
-	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
+	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardRule 捕获。
 	return ErrNone
 }
 
@@ -336,8 +458,13 @@ type Client struct {
 	effortsMu sync.RWMutex
 	efforts   map[string]map[string][]string
 
-	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
-	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
+	// defaultEfforts 缓存各模型 reasoning.defaultEffort（FetchModels 刷新），供
+	// thinking.go 补档：缺显式 effort 时优先用模型声明默认档，空串回退硬编码 high。
+	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
+	defaultEfforts map[string]map[string]string
+
+	// globalModels 缓存 global 模型名目录纯动态探测结果（1h TTL + 5min 负缓存），
+	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
@@ -348,7 +475,7 @@ type Client struct {
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
 	// （仅当 client_name 非空，见 billingUA）。
 	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUA。默认值已对齐官方（A 段变更），
+	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUAFor。默认值已对齐官方（A 段变更），
 	// 用户仍可显式配置完全自定义的 UA。
 	UserAgent string
 
@@ -395,12 +522,6 @@ type Client struct {
 	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
-
-	// UsageBaseCN / UsageBaseGlobal 积分消耗明细（get-user-request-usage）所在主机：
-	// 官网 usercenter 同源，与 billing base 不同（CN 实测仅在 www.workbuddy.cn 提供，
-	// codebuddy.cn 同路径 404/400）。空 = 回落默认。
-	UsageBaseCN     string
-	UsageBaseGlobal string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -418,7 +539,6 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
-		UsageBaseCN:          "https://www.workbuddy.cn",
 	}
 }
 
@@ -464,8 +584,21 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
-func (c *Client) prepareBody(body []byte, realm string) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
+// conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
+// body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+	if realmKey(realm) == "global" {
+		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
+		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
+		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
+		efforts, defs = globalEffortMap(efforts, defs)
+	}
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
+	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
+	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
+	body = InjectPromptCacheKey(body, uid, conversationID)
+	return body
 }
 
 // effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
@@ -483,12 +616,58 @@ func (c *Client) effortsSnapshot(realm string) map[string][]string {
 	return cp
 }
 
+// defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 缓存副本；
+// 该域无探测或无声明默认档 → nil（thinking.go 回退硬编码 high）。
+func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket, ok := c.defaultEfforts[realmKey(realm)]
+	if !ok || len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
+}
+
 // realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
 func realmKey(realm string) string {
 	if realm == "" {
 		return "cn"
 	}
 	return realm
+}
+
+// storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
+// 供 CN FetchModels 与 global 探测共用：拉取到的模型档位落桶后，出站请求体 normalizeReasoningEffort
+// 才能按域降级。efforts 与 defs 均空时删除该 realm 桶（等价「该域无可降级档位」）。
+// 调用方负责在「无新数据」时跳过写（CN 侧空桶不清既有桶，见 FetchModels 尾部）。
+func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs map[string]string) {
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.efforts == nil {
+		c.efforts = make(map[string]map[string][]string)
+	}
+	if c.defaultEfforts == nil {
+		c.defaultEfforts = make(map[string]map[string]string)
+	}
+	k := realmKey(realm)
+	if len(efforts) == 0 && len(defs) == 0 {
+		delete(c.efforts, k)
+		delete(c.defaultEfforts, k)
+		return
+	}
+	c.efforts[k] = efforts
+	c.defaultEfforts[k] = defs
+}
+
+// GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
+// 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
+// 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
+func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults map[string]string) {
+	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
@@ -527,13 +706,18 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 }
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
+// body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
+// Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
@@ -657,6 +841,9 @@ const (
 func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
+// DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
+// （handler 传 r.Context()）。迁 export_test.go 不可行——测试需要真实
+// HTTP 回放走完整 chatPaths/monitorBody 链路，与生产共用同一实现。
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
 //
@@ -673,13 +860,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
-	prepared := c.prepareBody(body, a.Realm())
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
+	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
+	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for attempt, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
@@ -698,9 +887,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
 			cancel()
+			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
+			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
+			if rerr != nil {
+				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
@@ -715,8 +910,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
 		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
-	cancel()
-	return nil, 0, nil, nil
+	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
 // chatPaths 返回按 realm 的 chat 路径候选序列：
@@ -728,22 +922,97 @@ func (c *Client) chatPaths(a *auth.Auth) []string {
 	return []string{chatCompletionsPath}
 }
 
-// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
+// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
+// CN /console 与 global /v2 的模型对象同构（2026-09-15 global 真实账号 /v2 探测
+// 实证，字段集与任务书 hy3 样本一致），故共用此结构；上游省略的字段保持零值，
+// /v1/models 侧按「空值省略」透出（不编造）。
 type ModelInfo struct {
-	ID            string
-	Name          string
-	ContextWindow int64    // = maxInputTokens
-	MaxTokens     int64    // = maxOutputTokens
-	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
+	ID             string
+	Name           string
+	ContextWindow  int64    // = maxInputTokens
+	MaxTokens      int64    // = maxOutputTokens
+	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
+	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
+	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+
+	// 以下为模型目录全字段补齐（任务书 models-full-fields）：
+	Description       string   // descriptionZh 中文描述
+	Credits           string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
+	Tags              []string // tags 模型标签（含 badge:限时免费 等）
+	Vendor            string   // vendor 厂商标识
+	IsDefault         bool     // isDefault 是否默认模型
+	SupportsReasoning bool     // supportsReasoning 是否支持推理
+	SupportsToolCall  bool     // supportsToolCall 是否支持工具调用
+	OnlyReasoning     bool     // onlyReasoning 是否纯推理模型
+	MaxAllowedSize    int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
+	ReasoningEffort   string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
+	ReasoningSummary  string   // reasoning.summary 推理摘要模式（如 "auto"）
+}
+
+// dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
+// FetchModels 与 global_models.go 的探测共用。iconUrl/descriptionEn/生成参数等
+// 按「不透出」原则不解析（任务书 §不透出字段）。
+type dynModelEntry struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Description     string   `json:"descriptionZh"`
+	Credits         string   `json:"credits"`
+	Tags            []string `json:"tags"`
+	Vendor          string   `json:"vendor"`
+	IsDefault       bool     `json:"isDefault"`
+	MaxInputTokens  int64    `json:"maxInputTokens"`
+	MaxOutputTokens int64    `json:"maxOutputTokens"`
+	MaxAllowedSize  int64    `json:"maxAllowedSize"`
+	Disabled        bool     `json:"disabled"`
+	SupportsImages  bool     `json:"supportsImages"`
+	SupportsReason  bool     `json:"supportsReasoning"`
+	SupportsTool    bool     `json:"supportsToolCall"`
+	OnlyReasoning   bool     `json:"onlyReasoning"`
+	Reasoning       struct {
+		Effort           string   `json:"effort"`
+		Summary          string   `json:"summary"`
+		DefaultEffort    string   `json:"defaultEffort"`
+		SupportedEfforts []string `json:"supportedEfforts"`
+	} `json:"reasoning"`
+}
+
+// modelInfo 按解析条目构造 ModelInfo（dynEntry→ModelInfo 映射的单一事实来源，
+// CN FetchModels 与 global 探测共用，杜绝两域映射漂移）。
+func (m dynModelEntry) modelInfo() ModelInfo {
+	return ModelInfo{
+		ID:                m.ID,
+		Name:              m.Name,
+		ContextWindow:     m.MaxInputTokens,
+		MaxTokens:         m.MaxOutputTokens,
+		Efforts:           m.Reasoning.SupportedEfforts,
+		DefaultEffort:     m.Reasoning.DefaultEffort,
+		SupportsImages:    m.SupportsImages,
+		Description:       m.Description,
+		Credits:           m.Credits,
+		Tags:              m.Tags,
+		Vendor:            m.Vendor,
+		IsDefault:         m.IsDefault,
+		SupportsReasoning: m.SupportsReason,
+		SupportsToolCall:  m.SupportsTool,
+		OnlyReasoning:     m.OnlyReasoning,
+		MaxAllowedSize:    m.MaxAllowedSize,
+		ReasoningEffort:   m.Reasoning.Effort,
+		ReasoningSummary:  m.Reasoning.Summary,
+	}
 }
 
 // 模型目录端点路径常量（按 realm 切）：
 // CN 现状 /console/enterprises/personal/models 逐字保留（零回归）；
 // global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
 // credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
+// v3ConfigPath 是 CN/global 双域通用的 /v3/config 模型目录端点（v3 系客户端权威
+// 目录；UA 门禁：仅三段式 CLI UA 可过，CommonHeaders 即满足，见
+// .claude/reports/global-models-missing.md）：v3 为主、企业端点补缺（任务书
+// v3-config-merge）。
 const (
 	cnModelsPath     = "/console/enterprises/personal/models"
 	globalModelsPath = "/v2/enterprises/personal/models"
+	v3ConfigPath     = "/v3/config"
 )
 
 // modelsPath 按 realm 返回动态模型目录端点路径（不含 base）。
@@ -757,9 +1026,121 @@ func (c *Client) modelsPath(a *auth.Auth) string {
 	return cnModelsPath
 }
 
-// FetchModels 调上游动态模型接口。
+// nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
+// 来源：harness buddy.ts:547-555。三类规则：
+//   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
+//   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
+//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
+		if strings.HasPrefix(id, p) {
+			return true
+		}
+	}
+	if maxOutputTokens > 0 && maxOutputTokens <= 256 {
+		return true
+	}
+	for _, t := range tags {
+		if t == "text-to-image" {
+			return true
+		}
+	}
+	return false
+}
+
+// FetchModels 调上游动态模型接口（CN 侧；global 账号按 modelsPath 走 /v2，v3 补充
+// 见 global_models.go FetchGlobalModels 家族，本方法职责不变）。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
+//
+// v3-config-merge：动态目录 = /v3/config（主）+ 企业端点（/console 或 global /v2，
+// 补缺）的并集，两路**并发**探测（任务书 v3-config-merge 需求 3/4）。两域口径各自
+// 保留：CN 按 agents[cli].models 过滤（零回归）；合并去重 key = 模型 id，v3 条目优先
+// （credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型。/v3 失败（400/网络错/解析
+// 失败）不拖累企业端点结果——降级为仅企业端点，warn 日志；反之亦然（两路独立容错）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	type probeResult struct {
+		infos []ModelInfo
+		err   error
+	}
+	enterpriseCh := make(chan probeResult, 1)
+	v3Ch := make(chan probeResult, 1)
+	go func() {
+		infos, err := c.fetchEnterpriseModels(a)
+		enterpriseCh <- probeResult{infos, err}
+	}()
+	go func() {
+		infos, err := c.fetchV3Models(a)
+		v3Ch <- probeResult{infos, err}
+	}()
+	enterprise := <-enterpriseCh
+	v3 := <-v3Ch
+	if enterprise.err != nil && v3.err != nil {
+		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
+	}
+	if v3.err != nil {
+		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
+		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+	}
+	if enterprise.err != nil {
+		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+	}
+	out := mergeModelInfos(v3.infos, enterprise.infos)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("models api returned empty list")
+	}
+	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
+	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
+	cache := make(map[string][]string, len(out))
+	defCache := make(map[string]string, len(out))
+	for _, mi := range out {
+		if len(mi.Efforts) > 0 {
+			cache[mi.ID] = mi.Efforts
+		}
+		if mi.DefaultEffort != "" {
+			defCache[mi.ID] = mi.DefaultEffort
+		}
+	}
+	if len(cache) == 0 && len(defCache) == 0 {
+		return out, nil
+	}
+	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
+	c.storeEfforts(a.Realm(), cache, defCache)
+	return out, nil
+}
+
+// mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
+// credits 等字段以主端点为权威），secondary 只补 primary 缺失的 id。
+// 去重 key = 模型 id；输出顺序 = primary 原序在前、secondary 补充项（secondary 原序）
+// 在后——稳定输出，不依赖 map 迭代序（任务书实现要点：排序保持稳定）。
+func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
+	if len(secondary) == 0 {
+		return primary
+	}
+	seen := make(map[string]bool, len(primary)+len(secondary))
+	out := make([]ModelInfo, 0, len(primary)+len(secondary))
+	for _, mi := range primary {
+		if mi.ID == "" || seen[mi.ID] {
+			continue
+		}
+		seen[mi.ID] = true
+		out = append(out, mi)
+	}
+	for _, mi := range secondary {
+		if mi.ID == "" || seen[mi.ID] {
+			continue
+		}
+		seen[mi.ID] = true
+		out = append(out, mi)
+	}
+	return out
+}
+
+// fetchEnterpriseModels 单路探测企业模型端点（CN → /console/enterprises/personal/models；
+// global → /v2/enterprises/personal/models，按 modelsPath 分发）。解析口径：对象形态
+// agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除（既有 FetchModels 逐字保留，
+// v3-config-merge 重构抽出的单路函数）。
+func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	url := c.chatBase(a) + c.modelsPath(a)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -772,24 +1153,18 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		// 读失败 → 传输层错误（handler 侧该路径不 NoteError，见发现 6 的正确行为）。
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
 		Code int `json:"code"`
 		Data struct {
-			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
-				Reasoning       struct {
-					Effort           string   `json:"effort"`
-					SupportedEfforts []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
+			Models []dynModelEntry `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
 				Models []string `json:"models"`
@@ -812,23 +1187,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(cliIDs) == 0 {
 		return nil, fmt.Errorf("no cli agent models found")
 	}
-	dynMap := make(map[string]struct {
-		ID              string
-		Name            string
-		MaxInputTokens  int64
-		MaxOutputTokens int64
-		Disabled        bool
-		Efforts         []string
-	}, len(env.Data.Models))
+	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
+	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
+	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
+	dynMap := make(map[string]dynModelEntry, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
+		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
+			continue
+		}
+		dynMap[m.ID] = m
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
@@ -836,34 +1203,60 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if !ok || m.Disabled {
 			continue
 		}
-		out = append(out, ModelInfo{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.MaxInputTokens,
-			MaxTokens:     m.MaxOutputTokens,
-			Efforts:       m.Efforts,
-		})
+		out = append(out, m.modelInfo())
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
-	cache := make(map[string][]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
+	return out, nil
+}
+
+// fetchV3Models 单路探测 /v3/config（CN/global 双域通用，按 chatBase 切 base）。
+// 解析口径与 parseGlobalModelNames 对象形态一致（data.models[].id 优先、disabled 剔除、
+// 全字段落 ModelInfo）；v3 独有的 contextWindow/agent modelTags 额外字段自然忽略。
+// CN 侧不按 agents[cli] 过滤（与 global 探测口径一致：v3 面取全量 models）——
+// 实测 CN v3 51 模型含大量非 cli 面模型，cli 过滤后与 console 口径才有可比性；
+// 但 mergeModelInfos 以 enterprise（已 cli 过滤）为 secondary 补缺，v3 全量条目中
+// 只有企业端点缺失的 id 会进并集，实际生效口径仍是「cli 面并集」。
+func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+	url := c.chatBase(a) + v3ConfigPath
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
+	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
+	c.CommonHeaders(req, a)
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("v3 config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	names, infos, _, _, err := parseGlobalModelNames(raw)
+	if err != nil {
+		return nil, fmt.Errorf("v3 config parse: %w", err)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("v3 config empty list")
+	}
+	// v3 面全量 models 不经 agents[cli] 过滤，nes-/completion-/codewise- 嵨补全/图片
+	// 生成等非对话条目（企业端点的 nonChatModel 口径）同样要挡在目录外——
+	// 这里按同一 nonChatModel 规则过滤（selected ID 会选模型报 code=11102）。
+	out := make([]ModelInfo, 0, len(infos))
+	for _, mi := range infos {
+		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+			continue
 		}
+		out = append(out, mi)
 	}
-	if len(cache) == 0 {
-		return out, nil
-	}
-	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.effortsMu.Lock()
-	if c.efforts == nil {
-		c.efforts = make(map[string]map[string][]string)
-	}
-	c.efforts[realmKey(a.Realm())] = cache
-	c.effortsMu.Unlock()
 	return out, nil
 }
 
@@ -1099,88 +1492,9 @@ func IsAlreadyCheckin(err error) bool {
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
-}
-
-// UsageRec 一条积分消耗明细（按请求）。
-type UsageRec struct {
-	RequestTime string  // "2006-01-02 15:04:05"（上游本地 = CST）
-	Credit      float64 // 本次扣减积分（如 0.12）
-	Model       string
-}
-
-// UsageRecords 拉取账号在 [begin, end] 内的按请求积分消耗明细
-// （POST /billing/meter/get-user-request-usage，官网「积分消耗明细」同源；
-// 注意在 UsageBaseCN 主机、无 /v2 前缀，与 get-user-resource 的 /v2 路径不同）。
-// 带分页与上限保护：单账号/区间最多 maxUsagePages×pageSize 条，超出截断（趋势聚合仍成样）。
-func (c *Client) UsageRecords(a *auth.Auth, begin, end time.Time) ([]UsageRec, error) {
-	const (
-		pageSize     = 100
-		maxUsagePage = 10 // 1000 条/账号/区间封顶；响应含提示词快照，控制带宽
-	)
-	var out []UsageRec
-	total := 0
-	for page := 1; page <= maxUsagePage; page++ {
-		body := map[string]any{
-			"startTime": begin.Format("2006-01-02") + " 00:00:00",
-			"endTime":   end.Format("2006-01-02") + " 23:59:59",
-			"pageNum":   page,
-			"pageSize":  pageSize,
-		}
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			c.UsageBaseCN+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		c.BillingHeaders(req, a)
-		data, err := c.doJSON(req)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		var shape struct {
-			Total int `json:"total"`
-			Data  []struct {
-				RequestTime string      `json:"requestTime"`
-				Credit      json.Number `json:"credit"`
-				Model       string      `json:"model"`
-			} `json:"data"`
-		}
-		err = json.Unmarshal(data, &shape)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("request usage parse: %w", err)
-		}
-		total = shape.Total
-		for _, r := range shape.Data {
-			v, err := r.Credit.Float64()
-			if err != nil {
-				continue
-			}
-			out = append(out, UsageRec{RequestTime: r.RequestTime, Credit: v, Model: r.Model})
-		}
-		if len(shape.Data) == 0 || len(out) >= total {
-			break
-		}
-	}
-	return out, nil
+	return alreadyCheckinRule.hit(ue.Msg, strings.ToLower(ue.Msg))
 }
 
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return logfmt.Truncate(s, n)
 }
